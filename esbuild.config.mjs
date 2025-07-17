@@ -1,6 +1,8 @@
 import esbuild from "esbuild";
 import process from "process";
 import builtins from "builtin-modules";
+import fs from 'fs';
+import path from 'path';
 
 const prod = process.argv[2] === "production";
 
@@ -14,7 +16,7 @@ const context = await esbuild.context({
     sourcemap: "inline",
     sourcesContent: !prod,
     treeShaking: true,
-    outfile: "build/main.js",
+    outfile: "main.js",
 });
 
 if (prod) {
@@ -23,3 +25,5 @@ if (prod) {
 } else {
     context.watch().catch(() => process.exit(1));
 }
+// 构建成功后拷贝 manifest.json 到 build/
+fs.copyFileSync('manifest.json', 'build/manifest.json');

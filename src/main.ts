@@ -1,4 +1,13 @@
-import { Menu, Notice, Plugin, TAbstractFile, TFile, WorkspaceLeaf } from "obsidian";
+import {
+    Editor,
+    MarkdownView,
+    Menu,
+    Notice,
+    Plugin,
+    TAbstractFile,
+    TFile,
+    WorkspaceLeaf,
+} from "obsidian";
 
 import { ReviewResponse } from "src/algorithms/base/repetition-item";
 import { SrsAlgorithm } from "src/algorithms/base/srs-algorithm";
@@ -42,12 +51,69 @@ import { DEFAULT_SETTINGS, SettingsUtil, SRSettings, upgradeSettings } from "src
 import { TopicPath } from "src/topic-path";
 import { convertToStringOrEmpty, TextDirection } from "src/utils/strings";
 
+import {
+    convertGradeTypeToRating,
+    createNewFsrsCard,
+    generateLocalTimeId,
+    parseFsrsCardFromContent,
+    readFileContentByPath,
+    scheduleFsrsCard,
+    updateTagsInRawFrontmatter,
+    updateWsrFieldsInContent,
+} from "src/algorithms/fsrs/fsrs";
+import { GradeType, Rating } from "ts-fsrs";
+import { debug } from "console";
+import { around } from "monkey-around";
+import { FourButtonModal } from "./gui/FourButtonModel";
+import { ReviewQueue } from "./algorithms/fsrs/review-queue";
+
+declare module "obsidian" {
+    interface App {
+        commands: {
+            commands: { [commandId: string]: { id: string; name: string; callback: () => void } };
+            executeCommandById(commandId: string): boolean;
+        };
+    }
+    interface FoldPosition {
+        from: number;
+        to: number;
+    }
+    interface FoldInfo {
+        folds: FoldPosition[];
+        lines: number;
+    }
+    interface MarkdownSubView {
+        applyFoldInfo(foldInfo: FoldInfo): void;
+        getFoldInfo(): FoldInfo | null;
+    }
+}
+
+// 打开下一个复习卡片的辅助函数
+export async function openNextReviewCard(app: any, globalReviewQueue: any) {
+    const next = globalReviewQueue.getNext();
+    if (!next) {
+        new Notice("No due review cards found.");
+        return;
+    }
+    //todo fix
+    const view = app.workspace.getActiveViewOfType(MarkdownView);
+    if (view) {
+        await view.leaf.openFile(next);
+        new Notice(`Opened: ${next.basename}`);
+    } else {
+        new Notice("No active pane to open file.");
+    }
+}
+
 export default class SRPlugin extends Plugin {
     public data: PluginData;
     public osrAppCore: OsrAppCore;
     public tabViewManager: TabViewManager;
     private osrSidebar: OsrSidebar;
     private nextNoteReviewHandler: NextNoteReviewHandler;
+
+    //全局复习队列
+    private globalReviewQueue: ReviewQueue;
 
     private ribbonIcon: HTMLElement | null = null;
     private statusBar: HTMLElement | null = null;
@@ -59,15 +125,19 @@ export default class SRPlugin extends Plugin {
         leaf?: WorkspaceLeaf,
     ) => void;
 
+    // 插件加载生命周期入口
     async onload(): Promise<void> {
-        // Closes all still open tab views when the plugin is loaded, because it causes bugs / empty windows otherwise
+        // 启动时，关闭所有插件相关的tab视图，防止遗留空白窗口或异常
         this.tabViewManager = new TabViewManager(this);
         this.app.workspace.onLayoutReady(async () => {
             this.tabViewManager.closeAllTabViews();
         });
 
+        this.globalReviewQueue = new ReviewQueue(this.app);
+        // 加载插件数据（包括用户设置等）
         await this.loadPluginData();
 
+        // 初始化笔记复习队列和下一个笔记复习处理器
         const noteReviewQueue = new NoteReviewQueue();
         this.nextNoteReviewHandler = new NextNoteReviewHandler(
             this.app,
@@ -75,8 +145,10 @@ export default class SRPlugin extends Plugin {
             noteReviewQueue,
         );
 
+        // 初始化侧边栏
         this.osrSidebar = new OsrSidebar(this, this.data.settings, this.nextNoteReviewHandler);
         this.osrSidebar.init();
+        // 布局准备好后激活复习队列面板，并自动同步数据
         this.app.workspace.onLayoutReady(async () => {
             await this.osrSidebar.activateReviewQueueViewPanel();
             setTimeout(async () => {
@@ -86,15 +158,17 @@ export default class SRPlugin extends Plugin {
             }, 2000);
         });
 
+        // 初始化问题延迟列表（用于暂缓某些卡片/笔记的复习）
         const questionPostponementList: QuestionPostponementList = new QuestionPostponementList(
             this,
             this.data.settings,
             this.data.buryList,
         );
-
+        // 构建笔记链接关系分析器
         const osrNoteLinkInfoFinder: ObsidianVaultNoteLinkInfoFinder =
             new ObsidianVaultNoteLinkInfoFinder(this.app.metadataCache);
 
+        // 初始化核心应用逻辑对象
         this.osrAppCore = new OsrAppCore(this.app);
         this.osrAppCore.init(
             questionPostponementList,
@@ -104,19 +178,23 @@ export default class SRPlugin extends Plugin {
             noteReviewQueue,
         );
 
+        // 注册插件图标
         appIcon();
 
+        // 显示/隐藏状态栏
         this.showStatusBar(this.data.settings.showStatusBar);
-
+        // 显示/隐藏功能区图标
         this.showRibbonIcon(this.data.settings.showRibbonIcon);
-
+        // 注册文件菜单（右键菜单）
         this.showFileMenuItems(!this.data.settings.disableFileMenuReviewOptions);
-
+        // 注册所有插件命令
         this.addPluginCommands();
-
+        // 添加设置面板
         this.addSettingTab(new SRSettingTab(this.app, this));
-
+        // 注册焦点监听（用于判断插件视图是否处于激活状态）
         this.registerSRFocusListener();
+        // 注册文件打开监听
+        this.registerFileOpenListener();
     }
 
     showFileMenuItems(status: boolean) {
@@ -179,6 +257,211 @@ export default class SRPlugin extends Plugin {
                     await this.sync();
                     this.nextNoteReviewHandler.reviewNextNoteModal();
                 }
+            },
+        });
+        //静默摘录
+        this.addCommand({
+            id: "extract-selection-to-note",
+            name: "Extract selected text to new note",
+            editorCallback: async (editor: Editor, view: MarkdownView) => {
+                const selectedText = editor.getSelection();
+                let newCard = createNewFsrsCard(new Date());
+                //初始化卡片.跳过new阶段
+                newCard = scheduleFsrsCard(newCard, new Date(), Rating.Good);
+                //新创建的卡片安排到下一天复习
+                newCard.due = new Date(new Date().getTime() + 24 * 60 * 60 * 1000);
+                if (!selectedText) {
+                    new Notice("No text selected!");
+                    return;
+                }
+
+                const title = `Extracted-${generateLocalTimeId()}`;
+                const folder = "extracted"; // 你可以改成别的路径
+                const filePath = `${folder}/${title}.md`;
+
+                //content通过读取一个指定文件的内容来生成
+                const content = await readFileContentByPath(this.app, "SRmeta/TP-SR-TEXT.md");
+                if (!content) {
+                    new Notice("Failed to read file content!");
+                    return;
+                }
+                let newContent = updateWsrFieldsInContent(content, newCard, view.file.basename);
+
+                //获取来源笔记的frontmatter中的tags,并设置到新卡片中
+                let tags = new Set<string>();
+                const sourceFile = view.file;
+                const sourceCache = this.app.metadataCache.getFileCache(sourceFile);
+                if (sourceCache) {
+                    const sourceTags = sourceCache.frontmatter?.tags;
+                    if (sourceTags) {
+                        tags = new Set(
+                            sourceTags.map((tag: string) =>
+                                tag.startsWith("#") ? tag : `#${tag}`,
+                            ),
+                        );
+                        console.log("tags", tags);
+                    }
+                }
+                //检查tags里是否有#review,需要确保其存在，并给tags去重
+                if (!tags.has("#review")) {
+                    tags.add("#review");
+                }
+                //将tags设置到frontmatter中 tags的格式是tags: ["#review","#SR-TEXT"]这种
+                newContent = updateTagsInRawFrontmatter(newContent, tags);
+
+                const wsrArgsRegex = /@TEXT@/;
+                newContent = newContent.replace(wsrArgsRegex, selectedText);
+
+                try {
+                    const existingFile = this.app.vault.getAbstractFileByPath(filePath);
+                    if (existingFile) {
+                        new Notice("File already exists!");
+                        return;
+                    }
+
+                    await this.app.vault.create(filePath, newContent);
+                    new Notice(`Created ${filePath}`);
+                    //更新全局复习队列
+                    await this.updateGlobalReviewQueue();
+                } catch (err) {
+                    console.error(err);
+                    new Notice("Failed to create note");
+                }
+            },
+        });
+        //创建QA卡片
+        this.addCommand({
+            id: "extract-qa-note",
+            name: "Extract selected text to new QA note",
+            editorCallback: async (editor: Editor, view: MarkdownView) => {
+                const selectedText = editor.getSelection();
+                let newCard = createNewFsrsCard(new Date());
+                //初始化卡片.跳过new阶段
+                newCard = scheduleFsrsCard(newCard, new Date(), Rating.Good);
+                //新创建的卡片安排到下一天复习
+                newCard.due = new Date(new Date().getTime() + 24 * 60 * 60 * 1000);
+                if (!selectedText) {
+                    new Notice("No text selected!");
+                    return;
+                }
+
+                const title = `QA-${generateLocalTimeId()}`;
+                const folder = "extracted"; // 你可以改成别的路径
+                const filePath = `${folder}/${title}.md`;
+
+                //content通过读取一个指定文件的内容来生成
+                const content = await readFileContentByPath(this.app, "SRmeta/TP-SR-QACARD.md");
+                if (!content) {
+                    new Notice("Failed to read file content!");
+                    return;
+                }
+                let newContent = updateWsrFieldsInContent(content, newCard, view.file.basename);
+
+                //获取来源笔记的frontmatter中的tags,并设置到新卡片中
+                let tags = new Set<string>();
+                const sourceFile = view.file;
+                const sourceCache = this.app.metadataCache.getFileCache(sourceFile);
+                if (sourceCache) {
+                    const sourceTags = sourceCache.frontmatter?.tags;
+                    if (sourceTags) {
+                        tags = new Set(
+                            sourceTags.map((tag: string) =>
+                                tag.startsWith("#") ? tag : `#${tag}`,
+                            ),
+                        );
+                        console.log("tags", tags);
+                    }
+                }
+                //检查tags里是否有#review,需要确保其存在，并给tags去重
+                if (!tags.has("#review")) {
+                    tags.add("#review");
+                }
+                //将tags设置到frontmatter中 tags的格式是tags: ["#review","#SR-TEXT"]这种
+                newContent = updateTagsInRawFrontmatter(newContent, tags);
+
+                const wsrArgsRegex = /@TEXT@/g;
+                newContent = newContent.replace(wsrArgsRegex, selectedText);
+
+                try {
+                    const existingFile = this.app.vault.getAbstractFileByPath(filePath);
+                    if (existingFile) {
+                        new Notice("File already exists!");
+                        return;
+                    }
+
+                    await this.app.vault.create(filePath, newContent);
+                    new Notice(`Created ${filePath}`);
+                    //更新全局复习队列
+                    await this.updateGlobalReviewQueue();
+                } catch (err) {
+                    console.error(err);
+                    new Notice("Failed to create note");
+                }
+            },
+        });
+        //显示复习状态弹窗
+        this.addCommand({
+            id: "show-button-modal",
+            name: "Show Button Modal",
+            callback: () => {
+                new FourButtonModal(this.app, async (choice: GradeType) => {
+                    new Notice(`You clicked: ${choice}`);
+                    //获取当前文档里的wsr信息，用fsrs算法进行计算，然后更新文档
+                    const openFile: TFile | null = this.app.workspace.getActiveFile();
+                    const folderName = "extracted";
+                    if (
+                        openFile &&
+                        openFile.extension === "md" &&
+                        openFile.path.startsWith(`${folderName}/`)
+                    ) {
+                        const content = await this.app.vault.read(openFile);
+                        if (!content) return;
+                        let oldCard = parseFsrsCardFromContent(content);
+                        let card = scheduleFsrsCard(
+                            oldCard,
+                            new Date(),
+                            convertGradeTypeToRating(choice),
+                        );
+                        const newContent = updateWsrFieldsInContent(content, card);
+                        await this.app.vault.modify(openFile, newContent);
+                        //更新全局复习队列
+                        await this.updateGlobalReviewQueue();
+                        //打开下一个复习卡片
+                        await openNextReviewCard(this.app, this.globalReviewQueue);
+                    }
+                }).open();
+            },
+        });
+        //dismiss当前笔记
+        this.addCommand({
+            id: "dismiss-current-note",
+            name: "Dismiss current note",
+            callback: async () => {
+                const openFile: TFile | null = this.app.workspace.getActiveFile();
+                const folderName = "extracted";
+                if (
+                    openFile &&
+                    openFile.extension === "md" &&
+                    openFile.path.startsWith(`${folderName}/`)
+                ) {
+                    const content = await this.app.vault.read(openFile);
+                    if (!content) return;
+                    //将文档中的 #review 修改为 #dismiss
+                    const newContent = content.replace(/#review/, "#dismiss");
+                    await this.app.vault.modify(openFile, newContent);
+                    //更新全局复习队列
+                    await this.updateGlobalReviewQueue();
+                    //打开下一个复习卡片
+                    await openNextReviewCard(this.app, this.globalReviewQueue);
+                }
+            },
+        });
+        this.addCommand({
+            id: "open-next-review-card",
+            name: "Open Next Review Card",
+            callback: async () => {
+                await this.globalReviewQueue.update();
+                await openNextReviewCard(this.app, this.globalReviewQueue);
             },
         });
 
@@ -357,6 +640,89 @@ export default class SRPlugin extends Plugin {
             this.app.workspace.on("active-leaf-change", this.handleFocusChange.bind(this)),
         );
     }
+    public registerFileOpenListener() {
+        // this.registerEvent(
+        //     this.app.workspace.on("file-open", (file: TFile | null) => {
+        //       if (!file) return;
+
+        //       const folderName = "extracted"; // 替换为你的文件夹名称
+        //         // 如果文件在extracted文件夹中，则折叠frontmatter
+        //      if(file.path.startsWith(`${folderName}/`)){
+        //       const currentLeaf = document.querySelector('.workspace-leaf.mod-active')
+        //       if (currentLeaf) {
+        //           const propertiesAreFolded = currentLeaf.querySelector('.metadata-container.is-collapsed')
+        //           if (!propertiesAreFolded) {
+        //               this.app.commands.executeCommandById('editor:toggle-fold-properties');
+        //           }
+        //       }
+        //     }
+        //     // debugger;
+        //     })
+        // );
+
+        // const leaf = this.app.workspace.getLeaf();
+        // if (!leaf) return;
+        // const view = leaf.view as MarkdownView;
+        // if (!view) return;
+
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (!view) return;
+        //直接hook onLoadFile方法，也就是在加载文件内容后控制折叠属性
+        this.register(
+            around(view.constructor.prototype, {
+                onLoadFile(old: (file: TFile) => void) {
+                    return async function (file: TFile) {
+                        await old.call(this, file);
+                        const folderName = "extracted";
+                        const folds: [number, number][] = []; 
+                        // console.log("onLoadFile 行数: ", view.editor.lineCount()); 
+                        //处理frontmatter的折叠
+                        if (file.path.startsWith(`${folderName}/`)) {
+                            let startLine = -1;
+                            let endLine = -1;
+                            for (let i = 0; i < view.editor.lineCount(); i++) {
+                                const line = view.editor.getLine(i);
+                                if (
+                                    startLine == -1 &&
+                                    line.trim().toLowerCase().startsWith("---")
+                                ) {
+                                    startLine = i;
+                                    continue;
+                                }
+                                if (
+                                    startLine != -1 &&
+                                    line.trim().toLowerCase().startsWith("---")
+                                ) {
+                                    endLine = i;
+                                    break;
+                                }
+                            }
+                            if (startLine != -1 && endLine != -1) {
+                                folds.push([startLine, endLine]);
+                            }
+                        }
+                        //处理answer的折叠
+                        if (file.path.startsWith(`${folderName}/QA-`)) {
+                            for (let i = 0; i < view.editor.lineCount(); i++) {
+                                const line = view.editor.getLine(i);
+                                if (line.trim().toLowerCase().startsWith("## answer")) {
+                                    folds.push([i, view.editor.lineCount()]);
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (folds.length > 0) {
+                            view.currentMode.applyFoldInfo({
+                                folds: folds.map(([from, to]) => ({ from, to })),
+                                lines: view.editor.lineCount(),
+                            });
+                        }
+                    };
+                },
+            }),
+        );
+    }
 
     public removeSRFocusListener() {
         this.setSRViewInFocus(false);
@@ -421,6 +787,9 @@ export default class SRPlugin extends Plugin {
             cardOrder,
         };
         return new DeckTreeIterator(iteratorOrder, null);
+    }
+    async updateGlobalReviewQueue(): Promise<void> {
+        await this.globalReviewQueue.update();
     }
 
     async sync(): Promise<void> {

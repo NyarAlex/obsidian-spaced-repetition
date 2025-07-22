@@ -1,3 +1,4 @@
+import { around } from "monkey-around";
 import {
     Editor,
     MarkdownView,
@@ -6,11 +7,24 @@ import {
     Plugin,
     TAbstractFile,
     TFile,
+    TFolder,
     WorkspaceLeaf,
 } from "obsidian";
+import { GradeType, Rating } from "ts-fsrs";
 
 import { ReviewResponse } from "src/algorithms/base/repetition-item";
 import { SrsAlgorithm } from "src/algorithms/base/srs-algorithm";
+import {
+    batchAddTagsToFile,
+    convertGradeTypeToRating,
+    createNewFsrsCard,
+    generateLocalTimeId,
+    parseFsrsCardFromContent,
+    readFileContentByPath,
+    scheduleFsrsCard,
+    updateTagsInRawFrontmatterToContent,
+    updateWsrFieldsInContent,
+} from "src/algorithms/fsrs/fsrs";
 import { ObsidianVaultNoteLinkInfoFinder } from "src/algorithms/osr/obsidian-vault-notelink-info-finder";
 import { SrsAlgorithmOsr } from "src/algorithms/osr/srs-algorithm-osr";
 import { OsrAppCore } from "src/core";
@@ -51,21 +65,8 @@ import { DEFAULT_SETTINGS, SettingsUtil, SRSettings, upgradeSettings } from "src
 import { TopicPath } from "src/topic-path";
 import { convertToStringOrEmpty, TextDirection } from "src/utils/strings";
 
-import {
-    convertGradeTypeToRating,
-    createNewFsrsCard,
-    generateLocalTimeId,
-    parseFsrsCardFromContent,
-    readFileContentByPath,
-    scheduleFsrsCard,
-    updateTagsInRawFrontmatter,
-    updateWsrFieldsInContent,
-} from "src/algorithms/fsrs/fsrs";
-import { GradeType, Rating } from "ts-fsrs";
-import { debug } from "console";
-import { around } from "monkey-around";
-import { FourButtonModal } from "./gui/FourButtonModel";
 import { ReviewQueue } from "./algorithms/fsrs/review-queue";
+import { FourButtonModal } from "./gui/FourButtonModel";
 
 declare module "obsidian" {
     interface App {
@@ -307,7 +308,7 @@ export default class SRPlugin extends Plugin {
                     tags.add("#review");
                 }
                 //将tags设置到frontmatter中 tags的格式是tags: ["#review","#SR-TEXT"]这种
-                newContent = updateTagsInRawFrontmatter(newContent, tags);
+                newContent = updateTagsInRawFrontmatterToContent(newContent, tags);
 
                 const wsrArgsRegex = /@TEXT@/;
                 newContent = newContent.replace(wsrArgsRegex, selectedText);
@@ -377,7 +378,7 @@ export default class SRPlugin extends Plugin {
                     tags.add("#review");
                 }
                 //将tags设置到frontmatter中 tags的格式是tags: ["#review","#SR-TEXT"]这种
-                newContent = updateTagsInRawFrontmatter(newContent, tags);
+                newContent = updateTagsInRawFrontmatterToContent(newContent, tags);
 
                 const wsrArgsRegex = /@TEXT@/g;
                 newContent = newContent.replace(wsrArgsRegex, selectedText);
@@ -416,8 +417,8 @@ export default class SRPlugin extends Plugin {
                     ) {
                         const content = await this.app.vault.read(openFile);
                         if (!content) return;
-                        let oldCard = parseFsrsCardFromContent(content);
-                        let card = scheduleFsrsCard(
+                        const oldCard = parseFsrsCardFromContent(content);
+                        const card = scheduleFsrsCard(
                             oldCard,
                             new Date(),
                             convertGradeTypeToRating(choice),
@@ -464,6 +465,26 @@ export default class SRPlugin extends Plugin {
                 await openNextReviewCard(this.app, this.globalReviewQueue);
             },
         });
+
+        this.registerEvent(
+            this.app.workspace.on("file-menu", (menu, file) => {
+                if (!file) {
+                    return;
+                }
+                // Add our custom menu item
+                menu.addItem((item) => {
+                    item.setTitle("批量添加Tag") // The text that appears in the menu
+                        .setIcon("tag") // Sets a tag icon for the command
+                        .onClick(() => {
+                            if ("children" in file) {
+                                batchAddTagsToFile(this.app, file as TFolder, new Set());
+                            } else {
+                                batchAddTagsToFile(this.app, file as TFile, new Set());
+                            }
+                        });
+                });
+            }),
+        );
 
         this.addCommand({
             id: "srs-note-review-easy",
@@ -641,24 +662,24 @@ export default class SRPlugin extends Plugin {
         );
     }
     public registerFileOpenListener() {
-        // this.registerEvent(
-        //     this.app.workspace.on("file-open", (file: TFile | null) => {
-        //       if (!file) return;
+        this.registerEvent(
+            this.app.workspace.on("file-open", (file: TFile | null) => {
+              if (!file) return;
 
-        //       const folderName = "extracted"; // 替换为你的文件夹名称
-        //         // 如果文件在extracted文件夹中，则折叠frontmatter
-        //      if(file.path.startsWith(`${folderName}/`)){
-        //       const currentLeaf = document.querySelector('.workspace-leaf.mod-active')
-        //       if (currentLeaf) {
-        //           const propertiesAreFolded = currentLeaf.querySelector('.metadata-container.is-collapsed')
-        //           if (!propertiesAreFolded) {
-        //               this.app.commands.executeCommandById('editor:toggle-fold-properties');
-        //           }
-        //       }
-        //     }
-        //     // debugger;
-        //     })
-        // );
+              const folderName = "extracted"; // 替换为你的文件夹名称
+                // 如果文件在extracted文件夹中，则折叠frontmatter
+             if(file.path.startsWith(`${folderName}/`)){
+              const currentLeaf = document.querySelector('.workspace-leaf.mod-active')
+              if (currentLeaf) {
+                  const propertiesAreFolded = currentLeaf.querySelector('.metadata-container.is-collapsed')
+                  if (!propertiesAreFolded) {
+                      this.app.commands.executeCommandById('editor:toggle-fold-properties');
+                  }
+              }
+            }
+            // debugger;
+            })
+        );
 
         // const leaf = this.app.workspace.getLeaf();
         // if (!leaf) return;
@@ -674,33 +695,33 @@ export default class SRPlugin extends Plugin {
                     return async function (file: TFile) {
                         await old.call(this, file);
                         const folderName = "extracted";
-                        const folds: [number, number][] = []; 
-                        // console.log("onLoadFile 行数: ", view.editor.lineCount()); 
-                        //处理frontmatter的折叠
-                        if (file.path.startsWith(`${folderName}/`)) {
-                            let startLine = -1;
-                            let endLine = -1;
-                            for (let i = 0; i < view.editor.lineCount(); i++) {
-                                const line = view.editor.getLine(i);
-                                if (
-                                    startLine == -1 &&
-                                    line.trim().toLowerCase().startsWith("---")
-                                ) {
-                                    startLine = i;
-                                    continue;
-                                }
-                                if (
-                                    startLine != -1 &&
-                                    line.trim().toLowerCase().startsWith("---")
-                                ) {
-                                    endLine = i;
-                                    break;
-                                }
-                            }
-                            if (startLine != -1 && endLine != -1) {
-                                folds.push([startLine, endLine]);
-                            }
-                        }
+                        const folds: [number, number][] = [];
+                        // console.log("onLoadFile 行数: ", view.editor.lineCount());
+                        // //处理frontmatter的折叠
+                        // if (file.path.startsWith(`${folderName}/`)) {
+                        //     let startLine = -1;
+                        //     let endLine = -1;
+                        //     for (let i = 0; i < view.editor.lineCount(); i++) {
+                        //         const line = view.editor.getLine(i);
+                        //         if (
+                        //             startLine == -1 &&
+                        //             line.trim().toLowerCase().startsWith("---")
+                        //         ) {
+                        //             startLine = i;
+                        //             continue;
+                        //         }
+                        //         if (
+                        //             startLine != -1 &&
+                        //             line.trim().toLowerCase().startsWith("---")
+                        //         ) {
+                        //             endLine = i;
+                        //             break;
+                        //         }
+                        //     }
+                        //     if (startLine != -1 && endLine != -1) {
+                        //         folds.push([startLine, endLine]);
+                        //     }
+                        // }
                         //处理answer的折叠
                         if (file.path.startsWith(`${folderName}/QA-`)) {
                             for (let i = 0; i < view.editor.lineCount(); i++) {

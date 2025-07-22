@@ -1,8 +1,11 @@
-import { App, TFile } from "obsidian";
-import { fsrs, generatorParameters, createEmptyCard, Rating, formatDate, GradeType } from "ts-fsrs"; // 假设你用的库
+import { App, Notice, TAbstractFile, TFile, TFolder, Vault } from "obsidian";
+import { createEmptyCard, formatDate, fsrs, generatorParameters, GradeType, Rating } from "ts-fsrs"; // 假设你用的库
 import { Card as FSRSCard } from "ts-fsrs"; // FSRS 的卡片类型
-import { formatDate as formatDateToString } from "src/utils/dates";
+
 import { PREFERRED_DATE_FORMAT } from "src/constants";
+import { formatDate as formatDateToString } from "src/utils/dates";
+
+import { TagInputModal } from "./tag-input-model";
 
 // 初始化FSRS算法参数（可根据需要调整）
 const params = generatorParameters({ enable_fuzz: true, enable_short_term: true });
@@ -25,6 +28,54 @@ export function generateLocalTimeId(date: Date = new Date()): string {
     const timestamp = `${year}${month}${day}${hours}${minutes}${seconds}${millis}`;
     return `ID-${timestamp}`;
 }
+// Helper function to get all markdown files in a folder recursively
+export function getMarkdownFilesInFolder(app: App, folder_path: string): TFile[] {
+    const files: TFile[] = [];
+    // Vault.recurseChildren is a powerful Obsidian API function
+    const folder = app.vault.getFolderByPath(folder_path);
+    if (!folder) {
+        return files;
+    }
+    Vault.recurseChildren(folder, (file: TFile) => {
+        // We only care about markdown files
+        if (file instanceof TFile && file.extension === "md") {
+            files.push(file);
+        }
+    });
+    return files;
+}
+export async function batchAddTagsToFile(app: App, file: TAbstractFile, tags: Set<string>) {
+    debugger;
+    //如果file是文件夹，则处理该文件夹下所有md文件；如果file是文件，则只处理该文件
+    let filesToProcess: TFile[] = [];
+    if (file instanceof TFolder) {
+        filesToProcess = getMarkdownFilesInFolder(app, file.path);
+    } else if (file instanceof TFile) {
+        filesToProcess = [file];
+    } else {
+        return;
+    }
+
+    new TagInputModal(app, async (newTag) => {
+        // Sanitize the tag: remove '#' and trim whitespace
+        new Notice(`正在为文件夹 "${file.name}" 下的所有文件添加Tag: "${newTag}"...`, 5000);
+
+        let processedCount = 0;
+
+        const allTags = new Set(tags);
+        allTags.add(newTag);
+        tags.forEach((tag) => {
+            allTags.add(tag);
+        });
+        // 3. Process each file
+        for (const mdFile of filesToProcess) {
+            await updateTagsInRawFrontmatter(app, mdFile, allTags);
+            processedCount++;
+        }
+        // 4. Show a completion notice
+        new Notice(`操作完成！共处理了 ${processedCount} 个文件。`, 5000);
+    }).open();
+}
 
 export function convertGradeTypeToRating(gradeType: GradeType): Rating {
     switch (gradeType) {
@@ -38,8 +89,35 @@ export function convertGradeTypeToRating(gradeType: GradeType): Rating {
             return Rating.Easy;
     }
 }
+export async function updateTagsInRawFrontmatter(
+    app: App,
+    mdFile: TFile,
+    tags: Set<string>,
+): Promise<void> {
+    try {
+        // Use Obsidian's built-in function to safely process frontmatter
+        await app.fileManager.processFrontMatter(mdFile, (frontmatter) => {
+            // This function handles everything:
+            // - It creates frontmatter if it doesn't exist.
+            // - It passes the existing frontmatter object to us.
 
-export function updateTagsInRawFrontmatter(content: string, tags: Set<string>): string {
+            // Ensure the 'tags' property exists and is an array
+            if (!frontmatter.tags) {
+                frontmatter.tags = [];
+            } else if (!Array.isArray(frontmatter.tags)) {
+                // If 'tags' exists but is not an array, convert it
+                frontmatter.tags = [String(frontmatter.tags)];
+            }
+
+            // Convert back to an array
+            frontmatter.tags = Array.from(tags);
+        });
+    } catch (e) {
+        console.error(`处理文件失败: ${mdFile.path}`, e);
+        new Notice(`处理文件 "${mdFile.name}" 失败，请查看开发者控制台。`);
+    }
+}
+export function updateTagsInRawFrontmatterToContent(content: string, tags: Set<string>): string {
     const newTagsLine = `tags: [${Array.from(tags)
         .map((t) => `"${t}"`)
         .join(", ")}]`;

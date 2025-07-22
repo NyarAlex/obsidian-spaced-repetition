@@ -1,5 +1,5 @@
 import { debug } from "console";
-import { App, TFile, moment } from "obsidian";
+import { App, moment, TFile } from "obsidian";
 
 export class ReviewQueue {
     private app: App;
@@ -61,7 +61,7 @@ export class ReviewQueue {
         }
         //加上时间衰退因子. 计算当前时间和最后复习时间直接的天数*P_TIME
         if (this.tagPriorityMapping["@P_TIME"]) {
-            const lastReviewDate = moment(fm.tags["wsr-last-review-date"], "YYYY-MM-DD");
+            const lastReviewDate = moment(fm["wsr-last-review-date"], "YYYY-MM-DD");
             const now = window.moment().startOf("day");
             const daysSinceLastReview = now.diff(lastReviewDate, "days");
             priority += daysSinceLastReview * this.tagPriorityMapping["@P_TIME"] || 0;
